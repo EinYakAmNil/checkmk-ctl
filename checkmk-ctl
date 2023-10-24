@@ -1,0 +1,316 @@
+#!/bin/env python3
+import argparse
+from pprint import pprint, pformat
+import requests
+import yaml
+
+rule_template = {
+    "host": {"address": ("direct", "$HOSTNAME$"), "virthost": "$HOSTNAME$"},
+    "mode": (
+        "url",
+        {
+            "onredirect": "follow",
+            "ssl": "auto",
+        },
+    ),
+}
+
+
+def get_common(iter1, iter2):
+    common = set(iter1) & set(iter2)
+    return list(common)
+
+
+def rule_parse(rule):
+    parsed_rule = eval(rule["extensions"]["value_raw"])
+
+    try:
+        parsed_rule["hostname"] = rule["extensions"]["conditions"]["host_name"][
+            "match_on"
+        ][0]
+    except KeyError:
+        parsed_rule["hostname"] = None
+
+    parsed_rule["folder"] = rule["extensions"]["folder"]
+
+    return parsed_rule, rule["id"]
+
+
+def plog(obj):
+    logging.debug((pformat(obj)))
+    return obj
+
+
+def get_missing(all, setup):
+    """Vergleicht zwei Listen und liefert alle Elemente der ersten Liste zurück, die nicht in der zweiten Liste enthalten sind."""
+
+    try:
+        neither = set(all) ^ set(setup)
+        missing_in_all = neither - set(setup)
+        return list(missing_in_all)
+    except TypeError:
+        return [item for item in all if item not in setup]
+
+
+def parse_config_rule(folder, hostname, uri_path, expect_regex):
+    rule_template = {
+        "host": {"address": ("direct", "$HOSTNAME$"), "virthost": "$HOSTNAME$"},
+        "mode": (
+            "url",
+            {
+                "onredirect": "follow",
+                "ssl": "auto",
+            },
+        ),
+    }
+    rule_template["folder"] = "/" + folder.lower()
+    rule_template["hostname"] = hostname
+    rule_template["name"] = uri_path
+    rule_template["mode"] = (
+        "url",
+        {
+            "expect_regex": tuple(expect_regex + [False] * (4 - len(expect_regex))),
+            "onredirect": "follow",
+            "ssl": "auto",
+            "uri": uri_path,
+        },
+    )
+    return rule_template
+
+
+def parse_host_wrap(folder, hostname, rule_config):
+    for uri_path, expect_regex in rule_config.items():
+        yield parse_config_rule(folder, hostname, uri_path, expect_regex)
+
+
+def parse_folder_wrap(folder, host):
+    for hostname, rule_config in host.items():
+        yield from parse_host_wrap(folder, hostname, rule_config)
+
+
+def unwrap_parser(config):
+    for folder, host in config.items():
+        yield from parse_folder_wrap(folder, host)
+
+
+class API:
+    def __init__(self, hostname, site, username, password):
+        """Nimmt Checkmk-URL, Checkmk-Site und Logindaten, um ein API Objekt zu erzeugen. Es besitzt Methoden, um die Checkmk Instanz zu abfragen und manipulieren."""
+        self.api_url = f"https://{hostname}/{site}/check_mk/api/1.0"
+        self.session = self._automation_login(username, password)
+
+    def get_folders(self):
+        resp = self.session.get(
+            f"{self.api_url}/domain-types/folder_config/collections/all",
+            params={
+                "parent": "/",
+                "recursive": True,
+                "show_hosts": False,
+            },
+        )
+
+        if resp.status_code == 200:
+            unparsed_resp = resp.json()["value"]
+            folders = [i["title"] for i in unparsed_resp]
+            return folders
+        elif resp.status_code == 204:
+            print("Done")
+        else:
+            raise RuntimeError(pprint.pformat(resp.json()))
+
+    def get_folder_hosts(self, folder):
+        folder_id = folder.replace("/", "~").lower()
+        resp = self.session.get(
+            f"{self.api_url}/objects/folder_config/~{folder_id}/collections/hosts",
+        )
+        if resp.status_code == 200:
+            data = resp.json()["value"]
+            ids = [i["id"] for i in data]
+            return ids
+        elif resp.status_code == 204:
+            print("Done")
+        else:
+            raise RuntimeError(pformat(resp.json()))
+
+    def get_folder_http_rules(self, folder):
+        resp = self.session.get(
+            f"{self.api_url}/domain-types/rule/collections/all",
+            params={
+                "ruleset_name": "active_checks:http",
+            },
+        )
+        if folder[0] != "/":
+            folder = "/" + folder
+
+        if resp.status_code != 200:
+            return None
+
+        rules = [
+            rule_parse(r)
+            for r in resp.json()["value"]
+            if r["extensions"]["folder"] == folder.lower()
+        ]
+
+        return rules
+
+    def _automation_login(self, username, password):
+        """Definiere die Authentifizierungsparameter für die Checkmk Instanz. Gibt ein Session Objekt zurück."""
+        session = requests.session()
+        session.headers["Authorization"] = f"Bearer {username} {password}"
+        session.headers["Accept"] = "application/json"
+
+        return session
+
+    def create_host(self, hostname, folder, attributes: dict = {}, bake_agent=False):
+        """Erstellt Hosts in Checkmk in einem bestimmten Ordner mit bestimmten Attributen. Diese können z.B. Labels für den Host sein."""
+        json_payload = {
+            "folder": folder,
+            "host_name": hostname,
+            "attributes": attributes,
+        }
+        return self.session.post(
+            f"{self.api_url}/domain-types/host_config/collections/all",
+            json=json_payload,
+        )
+
+    def create_host_rule(self, value_raw):
+        """Erstellt eine HTTP-check Regel für Hosts mit einen bestimmten Label."""
+        folder = value_raw["folder"]
+        hostname = value_raw["hostname"]
+        conditions = {"host_name": {"match_on": [hostname], "operator": "one_of"}}
+        value_raw.pop("folder")
+        value_raw.pop("hostname")
+
+        resp = self.session.post(
+            f"{self.api_url}/domain-types/rule/collections/all",
+            json={
+                "ruleset": "active_checks:http",
+                "folder": folder,
+                "properties": {"description": "", "disabled": False},
+                "value_raw": str(value_raw),
+                "conditions": conditions,
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            raise RuntimeError(pformat(resp.json()))
+
+    def create_label_rule(self, folder, label, uri, expect_regex):
+        """Erstellt eine HTTP-check Regel für Hosts mit einen bestimmten Label."""
+        parsed_expect = str(tuple(expect_regex + [False] * (4 - len(expect_regex))))
+        conditions = {
+            "host_labels": [{"key": label, "operator": "is", "value": "true"}]
+        }
+        rule_template = f"{{'host': {{'address': ('direct', '$HOSTNAME$'), 'virthost': '$HOSTNAME$'}},\n 'mode': ('url',\n          {{'expect_regex': {parsed_expect},\n           'ssl': 'auto',\n           'uri': '{uri}'}}),\n 'name': '{label}'}}"
+
+        resp = self.session.post(
+            f"{self.api_url}/domain-types/rule/collections/all",
+            json={
+                "ruleset": "active_checks:http",
+                "folder": folder,
+                "properties": {"description": label, "disabled": False},
+                "value_raw": rule_template,
+                "conditions": conditions,
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            raise RuntimeError(pformat(resp.json()))
+
+    def create_folder(self, folder, attributes={}):
+        resp = self.session.post(
+            f"{self.api_url}/domain-types/folder_config/collections/all",
+            json={
+                "name": folder.lower().replace("/", "~"),
+                "title": folder,
+                "parent": "/",
+                "attributes": attributes,
+            },
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(resp.status_code)
+            raise RuntimeError(pformat(resp.json()))
+
+    def delete_host(self, hostname):
+        resp = self.session.delete(
+            f"{self.api_url}/objects/host_config/{hostname}",
+        )
+        if resp.status_code == 200:
+            pprint.pprint(resp.json())
+        elif resp.status_code == 204:
+            print("Done")
+        else:
+            raise RuntimeError(pprint.pformat(resp.json()))
+
+    def delete_rule(self, rule_id):
+        resp = self.session.delete(
+            f"{self.api_url}/objects/rule/{rule_id}",
+        )
+        if resp.status_code == 200:
+            pprint.pprint(resp.json())
+        elif resp.status_code == 204:
+            print("Done")
+        else:
+            raise RuntimeError(pprint.pformat(resp.json()))
+
+
+if __name__ == "__main__":
+    cmdline_parser = argparse.ArgumentParser()
+    cmdline_parser.add_argument("-c", "--config")
+    cmdline_parser.add_argument("-a", "--auth")
+    cmdline_args = vars(cmdline_parser.parse_args())
+
+    pprint(cmdline_args)
+
+    with open(cmdline_args["config"], "r") as yaml_config:
+        config = yaml.safe_load(yaml_config)
+
+    with open(cmdline_args["auth"], "r") as yaml_config:
+        auth = yaml.safe_load(yaml_config)
+
+    api = API(**auth)
+    omd_folders = get_common(config, api.get_folders())
+
+    structure = {
+        folder: get_common(config[folder], api.get_folder_hosts(folder))
+        for folder in omd_folders
+    }
+    omd_rules = []
+    for folder in structure:
+        omd_rules += api.get_folder_http_rules(folder)
+
+    expected_rules = [rule for rule in unwrap_parser(config)]
+
+    for folder in config:
+        # print(folder)
+        if folder not in structure:
+            resp = api.create_folder(folder)
+            # plog(resp)
+
+            for host in config[folder]:
+                resp = api.create_host(host, "/" + folder.lower())
+                # plog(resp)
+
+        else:
+            for host in config[folder]:
+                if host not in structure[folder]:
+                    resp = api.create_host(host, "/" + folder.lower())
+                    # plog(resp)
+
+            for host in api.get_folder_hosts(folder):
+                if host not in config[folder]:
+                    resp = api.delete_host(host)
+                    plog(resp)
+
+    missing_rules = get_missing(expected_rules, [i[0] for i in omd_rules])
+    for rule in missing_rules:
+        api.create_host_rule(rule)
+
+    for rule, rule_id in omd_rules:
+        if rule not in expected_rules:
+            api.delete_rule(rule_id)
+

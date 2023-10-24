@@ -1,0 +1,9 @@
+TestFolder1:
+  hostname1.com:
+    /path1/to/monitor: [Keyword1]
+    /path2/to/monitor: [Keyword2]
+  example.com:
+    /another/path/to/monitor: [Up, To, Four, Keywords]
+TestFolder2:
+  hostname2.com:
+    /: [Keyword3]
