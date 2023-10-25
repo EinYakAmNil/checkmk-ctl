@@ -36,10 +36,6 @@ def rule_parse(rule):
     return parsed_rule, rule["id"]
 
 
-def plog(obj):
-    logging.debug((pformat(obj)))
-    return obj
-
 
 def get_missing(all, setup):
     """Vergleicht zwei Listen und liefert alle Elemente der ersten Liste zurück, die nicht in der zweiten Liste enthalten sind."""
@@ -260,11 +256,9 @@ class API:
 
 if __name__ == "__main__":
     cmdline_parser = argparse.ArgumentParser()
-    cmdline_parser.add_argument("-c", "--config")
-    cmdline_parser.add_argument("-a", "--auth")
+    cmdline_parser.add_argument("-c", "--config", default="config.yaml")
+    cmdline_parser.add_argument("-a", "--auth", default="auth.yaml")
     cmdline_args = vars(cmdline_parser.parse_args())
-
-    pprint(cmdline_args)
 
     with open(cmdline_args["config"], "r") as yaml_config:
         config = yaml.safe_load(yaml_config)
@@ -286,31 +280,33 @@ if __name__ == "__main__":
     expected_rules = [rule for rule in unwrap_parser(config)]
 
     for folder in config:
-        # print(folder)
         if folder not in structure:
+            print(f"Lege den Ordner {folder} an.")
             resp = api.create_folder(folder)
-            # plog(resp)
 
             for host in config[folder]:
+                print(f"Lege den Host {host} an.")
                 resp = api.create_host(host, "/" + folder.lower())
-                # plog(resp)
 
         else:
             for host in config[folder]:
                 if host not in structure[folder]:
+                    print(f"Lege den Host {host} an.")
                     resp = api.create_host(host, "/" + folder.lower())
-                    # plog(resp)
 
             for host in api.get_folder_hosts(folder):
                 if host not in config[folder]:
+                    print(f"Lösche den Host {host}.")
                     resp = api.delete_host(host)
-                    plog(resp)
 
     missing_rules = get_missing(expected_rules, [i[0] for i in omd_rules])
-    for rule in missing_rules:
-        api.create_host_rule(rule)
 
+    if missing_rules:
+        print("Erstelle fehlende Regeln.")
+        for rule in missing_rules:
+            api.create_host_rule(rule)
+
+    print("Lösche ungenutzte Regeln.")
     for rule, rule_id in omd_rules:
         if rule not in expected_rules:
             api.delete_rule(rule_id)
-
